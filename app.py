@@ -6,7 +6,7 @@ v3.0 — RAG corrigido, design refinado, branding Moura IA
 import streamlit as st
 
 st.set_page_config(
-    page_title="Moura IA Studio",
+    page_title="Moura IA",
     page_icon="🟢",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -612,12 +612,25 @@ class DB:
         if self._c: self._c.close(); self._c = None
 
 # ─── EMBEDDING ────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
 def load_embedder():
-    if not ST_OK: return None, 384
-    log.info("Carregando embedder...")
-    m = SentenceTransformer(EMBED_MODEL)
-    return m, m.get_sentence_embedding_dimension()
+    """Carrega embedder uma vez por sessão (session_state evita falhas no Python 3.14)."""
+    if "_embedder_loaded" not in st.session_state:
+        st.session_state._embedder_loaded = True
+        if not ST_OK:
+            st.session_state._embedder = None
+            st.session_state._emb_dim  = 384
+        else:
+            try:
+                log.info("Carregando embedder...")
+                m = SentenceTransformer(EMBED_MODEL)
+                st.session_state._embedder = m
+                st.session_state._emb_dim  = m.get_sentence_embedding_dimension()
+                log.info(f"Embedder OK dim={st.session_state._emb_dim}")
+            except Exception as e:
+                log.error(f"Embedder erro: {e}")
+                st.session_state._embedder = None
+                st.session_state._emb_dim  = 384
+    return st.session_state.get("_embedder"), st.session_state.get("_emb_dim", 384)
 
 # ─── VECTOR STORE ─────────────────────────────────────────────────────────────
 def _empty_store():
@@ -901,7 +914,15 @@ if not API_KEY:
 
 # Singleton services
 if "db"  not in st.session_state: st.session_state.db  = DB()
-if "rag" not in st.session_state: st.session_state.rag = RAG()
+if "rag" not in st.session_state:
+    try:
+        st.session_state.rag = RAG()
+    except Exception as _rag_e:
+        log.error(f"RAG init erro: {_rag_e}")
+        st.session_state.rag = RAG.__new__(RAG)
+        st.session_state.rag.embedder = None
+        st.session_state.rag.dim = 384
+        st.session_state.rag.vs = _empty_store()
 if "llm" not in st.session_state: st.session_state.llm = LLM(API_KEY)
 
 db:  DB  = st.session_state.db
@@ -991,7 +1012,7 @@ with st.sidebar:
     st.markdown("<div class='section-label'>Modelo</div>", unsafe_allow_html=True)
     idx = list(TEXT_MODELS.keys()).index(st.session_state.model_name) \
           if st.session_state.model_name in TEXT_MODELS else 0
-    mn = st.selectbox("", list(TEXT_MODELS.keys()), index=idx, label_visibility="collapsed")
+    mn = st.selectbox("Modelo de texto", list(TEXT_MODELS.keys()), index=idx, label_visibility="collapsed")
     st.session_state.model_name = mn
     MODEL_ID = TEXT_MODELS[mn]
 
@@ -1055,12 +1076,12 @@ with st.sidebar:
             prog.empty()
             if total > 0:
                 st.success(f"✅ {total} chunks indexados em {len(pdfs)} arquivo(s)")
-                st.rerun()
+                # NÃO usar st.rerun() aqui — o file_uploader perde estado e causa crash
             for e in errs: st.warning(e)
 
     if rag.count > 0:
         if st.button("🗑️ Limpar documentos", use_container_width=True):
-            rag.clear(); st.success("Documentos removidos"); st.rerun()
+            rag.clear(); st.success("Documentos removidos")
 
     st.divider()
 
@@ -1317,3 +1338,4 @@ def _bye():
     if "db" in st.session_state:
         try: st.session_state.db.close()
         except: pass
+
