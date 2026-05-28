@@ -8,3 +8,4 @@ requests
 Pillow
 protobuf
 numpy
+sentence-transformers
