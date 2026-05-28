@@ -637,19 +637,35 @@ with st.sidebar:
         <div style='margin:6px 0 10px;display:flex;flex-wrap:wrap;gap:4px'>{chips}</div>
         """, unsafe_allow_html=True)
 
+    # Uploader: sempre visível, botão sempre visível quando há arquivos no estado
     pdfs = st.file_uploader(
         "PDFs",
         type=["pdf"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"pdf_{st.session_state.img_key}",
+        help="Selecione um ou mais PDFs e clique em Indexar",
     )
 
+    # Guardar referência dos arquivos no session_state para não perder entre reruns
     if pdfs:
-        if st.button("⚡ Indexar PDFs", use_container_width=True):
+        st.session_state._pdfs_pending = pdfs
+
+    # Botão SEMPRE visível quando há PDFs selecionados (no uploader OU em pending)
+    has_pdfs = bool(pdfs or st.session_state.get("_pdfs_pending"))
+    files_to_index = pdfs if pdfs else st.session_state.get("_pdfs_pending", [])
+
+    if has_pdfs:
+        n_files = len(files_to_index)
+        fnames  = ", ".join(f.name for f in files_to_index[:3])
+        if n_files > 3: fnames += f" +{n_files-3}"
+        st.caption(f"📎 {n_files} arquivo(s): {fnames}")
+
+        if st.button("⚡ Indexar PDFs", use_container_width=True, type="primary"):
             total, errs = 0, []
-            prog = st.progress(0)
-            for i, f in enumerate(pdfs):
+            prog = st.progress(0, text="Lendo PDFs…")
+            for i, f in enumerate(files_to_index):
+                prog.progress((i / n_files), text=f"Processando: {f.name}")
                 try:
                     reader = PdfReader(f)
                     text = "".join(
@@ -664,13 +680,20 @@ with st.sidebar:
                         log.info(f"Indexado '{f.name}': {n} chunks")
                 except Exception as e:
                     errs.append(f"'{f.name}': {e}")
-                prog.progress((i+1)/len(pdfs))
+                    log.error(f"Erro ao indexar {f.name}: {e}")
+            prog.progress(1.0, text="Concluído!")
             prog.empty()
+
+            # Limpar pending após indexar
+            st.session_state.pop("_pdfs_pending", None)
+            st.session_state.img_key += 1  # reset uploader
+
             if total > 0:
-                st.success(f"✅ {total} chunks indexados ({len(pdfs)} arquivo(s))")
-                # Sem st.rerun() aqui — evita crash do file_uploader
+                st.success(f"✅ {total} chunks de {n_files} arquivo(s) indexados!")
+                # Forçar rerun só aqui, depois de limpar pending — sem risco de crash
+                st.rerun()
             elif not errs:
-                st.info("Nenhum chunk novo adicionado (arquivos já indexados?)")
+                st.info("Nenhum conteúdo novo (arquivos já indexados?)")
             for e in errs:
                 st.warning(e)
 
