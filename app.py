@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Optional
 import atexit
 import hashlib
+from sentence_transformers import SentenceTransformer
 
 # ------------------------------------------------------------
 # LOGGING
@@ -79,8 +80,6 @@ TEXT_MODELS = {
     "Nemotron 70B": "nvidia/nemotron-70b-instruct",
 }
 VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
-# Modelo de embedding que NÃO exige input_type
-EMBED_MODEL = "baai/bge-m3"
 
 # ------------------------------------------------------------
 # BANCO DE DADOS (com cache)
@@ -112,7 +111,20 @@ def get_db_connection():
 conn = get_db_connection()
 
 # ------------------------------------------------------------
-# ARMAZENAMENTO VETORIAL LOCAL (substituto do ChromaDB)
+# MODELO DE EMBEDDING LOCAL (substituto da API)
+# ------------------------------------------------------------
+@st.cache_resource
+def load_local_embedder():
+    """Carrega modelo de embedding leve e offline."""
+    logger.info("Carregando modelo de embedding local...")
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("Modelo de embedding carregado com sucesso.")
+    return model
+
+embedder = load_local_embedder()
+
+# ------------------------------------------------------------
+# ARMAZENAMENTO VETORIAL LOCAL
 # ------------------------------------------------------------
 VECTORS_FILE = "data/vectors.pkl"
 
@@ -138,7 +150,7 @@ def clean_text(text):
 def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
-def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+def cosine_similarity(vec1, vec2):
     norm1 = np.linalg.norm(vec1)
     norm2 = np.linalg.norm(vec2)
     if norm1 == 0 or norm2 == 0:
@@ -146,37 +158,29 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     return np.dot(vec1, vec2) / (norm1 * norm2)
 
 # ------------------------------------------------------------
-# RAG SERVICE (CORRIGIDO)
+# RAG SERVICE (agora com embedding LOCAL)
 # ------------------------------------------------------------
 class RAGService:
     def __init__(self):
-        self.client = client
         self.store = vector_store
+        self.model = embedder
 
     def embed(self, text):
-        """Gera embedding usando modelo BGE-M3 (não exige input_type)."""
+        """Gera embedding usando modelo SentenceTransformer local."""
         try:
-            resp = self.client.embeddings.create(
-                input=[text],
-                model=EMBED_MODEL,
-                encoding_format="float"
-            )
-            emb = np.array(resp.data[0].embedding)
-            logger.info(f"Embedding gerado com sucesso, dimensão: {emb.shape}")
+            emb = self.model.encode(text)
             return emb
         except Exception as e:
-            logger.error(f"Falha crítica no embedding: {e}")
-            st.error(f"⚠️ Embedding falhou: {e}")
+            logger.error(f"Falha no embedding local: {e}")
             return None
 
     def search(self, query, k=3):
         if not self.store["embeddings"]:
-            logger.warning("Nenhum documento indexado para busca RAG.")
+            logger.warning("Nenhum documento indexado.")
             return ""
         emb = self.embed(query)
         if emb is None:
             return ""
-        # Calcula similaridade
         scores = []
         for i, doc_emb in enumerate(self.store["embeddings"]):
             sim = cosine_similarity(emb, np.array(doc_emb))
@@ -184,12 +188,12 @@ class RAGService:
         scores.sort(key=lambda x: x[0], reverse=True)
         top_docs = [self.store["documents"][i] for _, i in scores[:k]]
         logger.info(f"RAG retornou {len(top_docs)} documentos.")
-        return "\n\n---\n\n".join(top_docs)  # Separador claro
+        return "\n\n---\n\n".join(top_docs)
 
     def add_document(self, filename, text):
         text = clean_text(text)
         if not text:
-            st.warning(f"PDF '{filename}' não contém texto extraível.")
+            st.warning(f"'{filename}' não contém texto.")
             return 0
         chunks = chunk_text(text)
         count = 0
@@ -201,7 +205,7 @@ class RAGService:
                 self.store["ids"].append(f"{filename}_{i}")
                 count += 1
         save_vectors(self.store)
-        logger.info(f"Documento '{filename}' indexado com {count} chunks.")
+        logger.info(f"'{filename}' indexado com {count} chunks.")
         return count
 
 rag = RAGService()
@@ -420,7 +424,7 @@ if prompt:
             st.image(image_path, width=300)
         st.markdown(prompt)
 
-    # RAG com indicador visual
+    # RAG local (sem API)
     rag_text = ""
     if vector_store["embeddings"]:
         with st.spinner("🔍 Buscando nos documentos..."):
@@ -445,7 +449,6 @@ if prompt:
                     st.error(answer)
                     used_model = "error"
         else:
-            # System prompt FORTE para obrigar o uso do RAG
             system = f"""Você é um assistente de IA. Utilize EXCLUSIVAMENTE as informações fornecidas nos documentos PDF abaixo para responder à pergunta. Se os documentos não contiverem a resposta, diga 'Não encontrei essa informação nos documentos fornecidos'. 
 
 📚 DOCUMENTOS PDF (use este conteúdo para responder):
