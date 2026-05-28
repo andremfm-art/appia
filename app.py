@@ -2,24 +2,20 @@ import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
 import chromadb
-from duckduckgo_search import DDGS
+from ddgs import DDGS  # NOVA biblioteca
 from gtts import gTTS
 from docx import Document
 import tempfile
 import sqlite3
 import os
-import requests
 import base64
 import time
 import logging
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional, Any
-import atexit
-import json
+from typing import Optional
 
-# Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -40,9 +36,9 @@ def load_api_key():
             api_key = st.session_state.api_key_value
         else:
             st.markdown("## 🔑 Configuração da API Key")
-            uploaded_file = st.file_uploader("Arquivo .env ou .txt com a chave", type=['env','txt'])
-            if uploaded_file:
-                content = uploaded_file.read().decode().strip()
+            uploaded = st.file_uploader("Arquivo .env ou .txt com a chave", type=['env','txt'])
+            if uploaded:
+                content = uploaded.read().decode().strip()
                 if '=' in content:
                     for line in content.split('\n'):
                         if line.startswith('NVIDIA_API_KEY='):
@@ -70,23 +66,17 @@ BASE_URL = "https://integrate.api.nvidia.com/v1"
 client = OpenAI(base_url=BASE_URL, api_key=NVIDIA_API_KEY)
 
 # ============================================================
-# MODELOS DISPONÍVEIS (incluindo visão)
+# MODELOS (somente IDs validados que responderam 200)
 # ============================================================
 TEXT_MODELS = {
-    "Llama 3.1 70B (recomendado)": "meta/llama-3.1-70b-instruct",
-    "Llama 3.1 8B (rápido)": "meta/llama-3.1-8b-instruct",
-    "DeepSeek-R1": "deepseek-ai/deepseek-r1-distill-llama-8b",
+    "Llama 3.1 70B": "meta/llama-3.1-70b-instruct",
+    "Llama 3.1 8B": "meta/llama-3.1-8b-instruct",
     "Nemotron 70B": "nvidia/nemotron-70b-instruct",
-    "Mistral Large 2": "mistralai/mistral-large-2-instruct",
 }
-VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"  # Modelo multimodal
+VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
 
-EMBEDDING_MODELS = {
-    "NV-Embed-QA v5": "nvidia/nv-embedqa-e5-v5",
-    "NV-EmbedQA 1B v2": "nvidia/llama-3.2-nv-embedqa-1b-v2",
-}
+EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
 
-# Configurações
 MAX_HISTORY = 10
 REQUEST_TIMEOUT = 30
 
@@ -118,7 +108,7 @@ chroma_client = chromadb.PersistentClient(path="data/chroma_db")
 collection = chroma_client.get_or_create_collection(name="docs")
 
 # ============================================================
-# SERVIÇOS
+# FUNÇÕES AUXILIARES
 # ============================================================
 def clean_text(text):
     import re
@@ -127,13 +117,51 @@ def clean_text(text):
 def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
+# ============================================================
+# SERVIÇO DE RAG (CORRIGIDO COM input_type)
+# ============================================================
+class RAGService:
+    def __init__(self):
+        self.client = client
+        self.collection = collection
+    
+    def embed(self, text, input_type="passage"):
+        """input_type = 'query' para busca, 'passage' para documentos"""
+        resp = self.client.embeddings.create(
+            input=[text],
+            model=EMBED_MODEL,
+            encoding_format="float",
+            timeout=REQUEST_TIMEOUT,
+            extra_body={"input_type": input_type}
+        )
+        return resp.data[0].embedding
+    
+    def search(self, query, k=3):
+        q_emb = self.embed(query, input_type="query")
+        results = self.collection.query(query_embeddings=[q_emb], n_results=k)
+        if results['documents']:
+            return "\n\n".join(results['documents'][0])
+        return ""
+    
+    def add_document(self, filename, text):
+        text = clean_text(text)
+        chunks = chunk_text(text)
+        for i, chunk in enumerate(chunks):
+            emb = self.embed(chunk, input_type="passage")
+            self.collection.add(documents=[chunk], embeddings=[emb], ids=[f"{filename}_{i}"])
+        return len(chunks)
+
+rag = RAGService()
+
+# ============================================================
+# SERVIÇO LLM COM FALLBACK
+# ============================================================
 class LLMService:
     def __init__(self):
         self.client = client
         self.fallback_chain = list(TEXT_MODELS.values())
     
-    def text_generate(self, messages, model, temperature=0.7, max_tokens=1024):
-        # Fallback entre modelos de texto
+    def generate(self, messages, model, temperature=0.7, max_tokens=1024):
         for m in [model] + [x for x in self.fallback_chain if x != model]:
             try:
                 resp = self.client.chat.completions.create(
@@ -145,33 +173,9 @@ class LLMService:
                 )
                 return resp.choices[0].message.content, m
             except Exception as e:
-                logger.warning(f"Falha com {m}: {e}")
+                logger.warning(f"Falha {m}: {e}")
                 time.sleep(0.5)
-        raise Exception("Nenhum modelo de texto disponível")
-    
-    def vision_generate(self, image_base64: str, prompt: str, temperature=0.7, max_tokens=1024):
-        """Usa o modelo de visão para analisar imagem + texto."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                    {"type": "text", "text": prompt}
-                ]
-            }
-        ]
-        try:
-            resp = self.client.chat.completions.create(
-                model=VISION_MODEL,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=REQUEST_TIMEOUT
-            )
-            return resp.choices[0].message.content, VISION_MODEL
-        except Exception as e:
-            # Fallback: tenta descrever a imagem com outro modelo? Ou retorna erro.
-            raise Exception(f"Modelo de visão falhou: {e}")
+        raise Exception("Nenhum modelo disponível")
     
     def generate_stream(self, messages, model, temperature=0.7, max_tokens=1024):
         stream = self.client.chat.completions.create(
@@ -185,50 +189,42 @@ class LLMService:
         for chunk in stream:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+    
+    def vision(self, image_base64, prompt, temperature=0.7, max_tokens=1024):
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            {"type": "text", "text": prompt}
+        ]}]
+        resp = self.client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=REQUEST_TIMEOUT
+        )
+        return resp.choices[0].message.content, VISION_MODEL
 
 llm = LLMService()
 
-class RAGService:
-    def __init__(self):
-        self.client = client
-        self.collection = collection
-    
-    def embed(self, text, model="nvidia/nv-embedqa-e5-v5"):
-        resp = self.client.embeddings.create(input=[text], model=model, encoding_format="float", timeout=REQUEST_TIMEOUT)
-        return resp.data[0].embedding
-    
-    def search(self, query, model="nvidia/nv-embedqa-e5-v5", k=3):
-        if not query:
-            return ""
-        emb = self.embed(query, model)
-        results = self.collection.query(query_embeddings=[emb], n_results=k)
-        if results['documents']:
-            return "\n\n".join(results['documents'][0])
-        return ""
-    
-    def add_document(self, filename, text, model="nvidia/nv-embedqa-e5-v5"):
-        text = clean_text(text)
-        chunks = chunk_text(text)
-        for i, chunk in enumerate(chunks):
-            emb = self.embed(chunk, model)
-            self.collection.add(documents=[chunk], embeddings=[emb], ids=[f"{filename}_{i}"])
-        return len(chunks)
-
-rag = RAGService()
-
+# ============================================================
+# BUSCA WEB (DDGS NOVA)
+# ============================================================
 def web_search(query, num=3):
     try:
         with DDGS() as ddgs:
             results = []
             for r in ddgs.text(query, max_results=num):
                 results.append(f"- {r['title']}: {r['body']}")
-            return "\n".join(results) if results else ""
+            return "\n".join(results)
     except:
         return ""
 
-def tts(text, lang='pt'):
+# ============================================================
+# TTS E EXPORTAÇÃO
+# ============================================================
+def tts(text):
     try:
-        tts_obj = gTTS(text[:500], lang=lang)
+        tts_obj = gTTS(text[:500], lang='pt')
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         tts_obj.save(tmp.name)
         return tmp.name
@@ -252,13 +248,11 @@ def export(messages, fmt='txt'):
     return b""
 
 # ============================================================
-# INTERFACE STREAMLIT
+# INTERFACE
 # ============================================================
-st.set_page_config(page_title="Assistente Multimodal NVIDIA", layout="wide")
-st.markdown("<h1 style='color:#76B900'>🤖 Assistente Multimodal NVIDIA</h1>", unsafe_allow_html=True)
-st.caption("Envie imagens e texto, como no ChatGPT, Claude ou DeepSeek")
+st.set_page_config(page_title="Assistente NVIDIA", layout="wide")
+st.markdown("<h1 style='color:#76B900'>🤖 Assistente NVIDIA NIM</h1>", unsafe_allow_html=True)
 
-# Inicialização de estado
 if "conv_id" not in st.session_state:
     cur = conn.cursor()
     convs = cur.execute("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1").fetchall()
@@ -280,17 +274,16 @@ if "conv_id" not in st.session_state:
 if "streaming" not in st.session_state:
     st.session_state.streaming = True
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Configurações")
-    model_name = st.selectbox("Modelo de texto", list(TEXT_MODELS.keys()), index=0)
+    model_name = st.selectbox("Modelo", list(TEXT_MODELS.keys()), index=0)
     model_id = TEXT_MODELS[model_name]
     temperature = st.slider("Temperatura", 0.0, 1.0, 0.7)
     max_tokens = st.slider("Max tokens", 256, 2048, 1024)
     st.session_state.streaming = st.checkbox("Streaming", True)
     web_enabled = st.checkbox("Busca Web", True)
     st.divider()
-    st.header("📄 PDFs (RAG)")
+    st.header("📄 PDFs")
     uploaded = st.file_uploader("Carregar PDFs", type="pdf", accept_multiple_files=True)
     if uploaded and st.button("Processar"):
         total = 0
@@ -316,91 +309,55 @@ for msg in st.session_state.messages:
             st.image(msg["image"], width=300)
         st.markdown(msg["content"])
 
-# Input multimodal
-uploaded_image = st.file_uploader("📎 Anexar imagem (opcional)", type=["png", "jpg", "jpeg"], key="image_upload")
+# Input
+uploaded_image = st.file_uploader("📎 Imagem (opcional)", type=["png","jpg","jpeg"], key="img")
 prompt = st.chat_input("Digite sua mensagem...")
 
 if prompt:
-    # Salva a imagem, se houver
     image_path = None
     image_base64 = None
     if uploaded_image:
         os.makedirs("data/images", exist_ok=True)
-        image_bytes = uploaded_image.read()
-        # Converte para base64
-        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        # Salva arquivo para referência
+        img_bytes = uploaded_image.read()
+        image_base64 = base64.b64encode(img_bytes).decode()
         ext = uploaded_image.name.split('.')[-1]
         image_path = f"data/images/{datetime.now().strftime('%Y%m%d%H%M%S')}.{ext}"
         with open(image_path, "wb") as f:
-            f.write(image_bytes)
+            f.write(img_bytes)
     
-    # Adiciona mensagem do usuário
     user_msg = {"role": "user", "content": prompt}
     if image_path:
         user_msg["image"] = image_path
     st.session_state.messages.append(user_msg)
-    
-    # Salva no banco
     conn.execute("INSERT INTO messages (conversation_id, role, content, image_path, model) VALUES (?,?,?,?,?)",
                  (st.session_state.conv_id, "user", prompt, image_path, model_id))
     conn.commit()
     
-    # Atualiza título
-    if len(st.session_state.messages) == 1:
-        conn.execute("UPDATE conversations SET title=? WHERE id=?", (prompt[:50], st.session_state.conv_id))
-        conn.commit()
-    
-    # Exibe mensagem do usuário
     with st.chat_message("user"):
         if image_path:
             st.image(image_path, width=300)
         st.markdown(prompt)
     
-    # Contexto RAG e web
     rag_text = rag.search(prompt)
     web_text = web_search(prompt) if web_enabled else ""
     
-    # Prepara mensagens para o modelo
     if image_base64:
-        # Modo multimodal: usa modelo de visão
-        system_vision = f"""Você é um assistente multimodal. Analise a imagem fornecida e responda à pergunta do usuário.
-Contexto adicional (documentos): {rag_text if rag_text else 'Nenhum'}
-Informações da web: {web_text if web_text else 'Nenhuma'}
-Responda em português."""
-        # O prompt do usuário já contém a imagem e o texto
-        user_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                        {"type": "text", "text": prompt}]
-        vision_messages = [{"role": "system", "content": system_vision},
-                           {"role": "user", "content": user_content}]
-        try:
-            with st.chat_message("assistant"):
-                with st.spinner("🧠 Analisando imagem..."):
-                    answer, used_model = llm.vision_generate(image_base64, prompt, temperature, max_tokens)
+        with st.chat_message("assistant"):
+            with st.spinner("🧠 Analisando imagem..."):
+                try:
+                    answer, used_model = llm.vision(image_base64, prompt, temperature, max_tokens)
                     st.markdown(answer)
-                st.caption(f"🤖 Modelo de visão: {used_model}")
-                # Áudio e downloads
-                audio_file = tts(answer)
-                if audio_file:
-                    with open(audio_file, "rb") as f:
-                        st.audio(f.read(), format="audio/mp3")
-                c1, c2, c3 = st.columns(3)
-                c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
-                c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
-                c3.download_button("📝 Conversa", export(st.session_state.messages, 'md'), file_name="conversa.md")
-        except Exception as e:
-            answer = f"❌ Erro no modelo de visão: {str(e)}"
-            with st.chat_message("assistant"):
-                st.error(answer)
-            used_model = "error"
+                except Exception as e:
+                    answer = f"❌ Erro: {e}"
+                    st.error(answer)
+                    used_model = "error"
     else:
-        # Modo texto normal
-        system_text = f"""Você é um assistente útil com acesso a informações externas.
+        system = f"""Você é um assistente útil.
 📚 Documentos: {rag_text if rag_text else 'Nenhum'}
 🌐 Web: {web_text if web_text else 'Nenhuma'}
 Responda em português."""
         recent = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-MAX_HISTORY:]]
-        final_msgs = [{"role": "system", "content": system_text}] + recent
+        final_msgs = [{"role": "system", "content": system}] + recent
         
         with st.chat_message("assistant"):
             if st.session_state.streaming:
@@ -414,28 +371,27 @@ Responda em português."""
                     answer = full
                     used_model = model_id
                 except Exception as e:
-                    answer = f"❌ Erro: {str(e)}"
+                    answer = f"❌ Erro: {e}"
                     placeholder.markdown(answer)
                     used_model = "error"
             else:
                 with st.spinner("Pensando..."):
                     try:
-                        answer, used_model = llm.text_generate(final_msgs, model_id, temperature, max_tokens)
+                        answer, used_model = llm.generate(final_msgs, model_id, temperature, max_tokens)
                     except Exception as e:
-                        answer = f"❌ Erro: {str(e)}"
+                        answer = f"❌ Erro: {e}"
                         used_model = "error"
                     st.markdown(answer)
-            st.caption(f"🤖 Modelo: {used_model}")
-            audio_file = tts(answer)
-            if audio_file:
-                with open(audio_file, "rb") as f:
-                    st.audio(f.read(), format="audio/mp3")
-            c1, c2, c3 = st.columns(3)
-            c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
-            c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
-            c3.download_button("📝 Conversa", export(st.session_state.messages, 'md'), file_name="conversa.md")
     
-    # Salva resposta
+    st.caption(f"🤖 {used_model}")
+    audio = tts(answer)
+    if audio:
+        with open(audio, "rb") as f:
+            st.audio(f.read(), format="audio/mp3")
+    c1, c2 = st.columns(2)
+    c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
+    c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
+    
     st.session_state.messages.append({"role": "assistant", "content": answer})
     conn.execute("INSERT INTO messages (conversation_id, role, content, model) VALUES (?,?,?,?)",
                  (st.session_state.conv_id, "assistant", answer, used_model))
