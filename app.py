@@ -2,10 +2,9 @@ import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
 import chromadb
-from ddgs import DDGS  # NOVA biblioteca
+from ddgs import DDGS
 from gtts import gTTS
 from docx import Document
-import tempfile
 import sqlite3
 import os
 import base64
@@ -15,13 +14,18 @@ from PIL import Image
 from io import BytesIO
 from datetime import datetime
 from typing import Optional
+import atexit
+import hashlib
 
+# ------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# CARREGAMENTO SEGURO DA CHAVE
-# ============================================================
+# ------------------------------------------------------------
+# CARREGAMENTO SEGURO DA CHAVE NVIDIA
+# ------------------------------------------------------------
 def load_api_key():
     api_key = None
     try:
@@ -65,9 +69,9 @@ NVIDIA_API_KEY = load_api_key()
 BASE_URL = "https://integrate.api.nvidia.com/v1"
 client = OpenAI(base_url=BASE_URL, api_key=NVIDIA_API_KEY)
 
-# ============================================================
-# MODELOS (somente IDs validados que responderam 200)
-# ============================================================
+# ------------------------------------------------------------
+# MODELOS (validados e funcionais)
+# ------------------------------------------------------------
 TEXT_MODELS = {
     "Llama 3.1 70B": "meta/llama-3.1-70b-instruct",
     "Llama 3.1 8B": "meta/llama-3.1-8b-instruct",
@@ -75,41 +79,52 @@ TEXT_MODELS = {
 }
 VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
 
-EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+# ------------------------------------------------------------
+# BANCO DE DADOS (com cache)
+# ------------------------------------------------------------
+@st.cache_resource
+def get_db_connection():
+    os.makedirs("data", exist_ok=True)
+    conn = sqlite3.connect("data/chat.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT DEFAULT 'Nova Conversa',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER,
+        role TEXT,
+        content TEXT,
+        image_path TEXT,
+        model TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+    )""")
+    conn.commit()
+    return conn
 
-MAX_HISTORY = 10
-REQUEST_TIMEOUT = 30
+conn = get_db_connection()
 
-# ============================================================
-# BANCO DE DADOS E CHROMADB
-# ============================================================
-os.makedirs("data", exist_ok=True)
-conn = sqlite3.connect("data/chat.db", check_same_thread=False)
-conn.row_factory = sqlite3.Row
-conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT DEFAULT 'Nova Conversa',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-)""")
-conn.execute("""CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER,
-    role TEXT,
-    content TEXT,
-    image_path TEXT,
-    model TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
-)""")
-conn.commit()
+# ------------------------------------------------------------
+# CHROMADB (RAG) – inicialização segura
+# ------------------------------------------------------------
+@st.cache_resource
+def get_chroma_collection():
+    try:
+        client = chromadb.PersistentClient(path="data/chroma_db")
+        return client.get_or_create_collection(name="docs")
+    except Exception as e:
+        logger.warning(f"ChromaDB não inicializado: {e}")
+        return None
 
-chroma_client = chromadb.PersistentClient(path="data/chroma_db")
-collection = chroma_client.get_or_create_collection(name="docs")
+collection = get_chroma_collection()
 
-# ============================================================
+# ------------------------------------------------------------
 # FUNÇÕES AUXILIARES
-# ============================================================
+# ------------------------------------------------------------
 def clean_text(text):
     import re
     return re.sub(r'\s+', ' ', text).strip()
@@ -117,120 +132,158 @@ def clean_text(text):
 def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
-# ============================================================
-# SERVIÇO DE RAG (CORRIGIDO COM input_type)
-# ============================================================
+# ------------------------------------------------------------
+# RAG SERVICE
+# ------------------------------------------------------------
 class RAGService:
     def __init__(self):
         self.client = client
         self.collection = collection
-    
-    def embed(self, text, input_type="passage"):
-        """input_type = 'query' para busca, 'passage' para documentos"""
-        resp = self.client.embeddings.create(
-            input=[text],
-            model=EMBED_MODEL,
-            encoding_format="float",
-            timeout=REQUEST_TIMEOUT,
-            extra_body={"input_type": input_type}
-        )
-        return resp.data[0].embedding
-    
+
+    def embed(self, text, input_type="query"):
+        try:
+            resp = self.client.embeddings.create(
+                input=[text],
+                model="nvidia/nv-embedqa-e5-v5",
+                encoding_format="float",
+                extra_body={"input_type": input_type}
+            )
+            return resp.data[0].embedding
+        except Exception as e:
+            logger.error(f"Embedding falhou: {e}")
+            return None
+
     def search(self, query, k=3):
-        q_emb = self.embed(query, input_type="query")
-        results = self.collection.query(query_embeddings=[q_emb], n_results=k)
-        if results['documents']:
-            return "\n\n".join(results['documents'][0])
+        if not self.collection:
+            return ""
+        emb = self.embed(query, input_type="query")
+        if not emb:
+            return ""
+        try:
+            results = self.collection.query(query_embeddings=[emb], n_results=k)
+            if results.get('documents'):
+                return "\n\n".join(results['documents'][0])
+        except Exception as e:
+            logger.error(f"Erro na busca RAG: {e}")
         return ""
-    
+
     def add_document(self, filename, text):
+        if not self.collection:
+            return 0
         text = clean_text(text)
         chunks = chunk_text(text)
+        count = 0
         for i, chunk in enumerate(chunks):
             emb = self.embed(chunk, input_type="passage")
-            self.collection.add(documents=[chunk], embeddings=[emb], ids=[f"{filename}_{i}"])
-        return len(chunks)
+            if emb:
+                try:
+                    self.collection.add(documents=[chunk], embeddings=[emb], ids=[f"{filename}_{i}"])
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Erro ao adicionar chunk: {e}")
+        return count
 
 rag = RAGService()
 
-# ============================================================
-# SERVIÇO LLM COM FALLBACK
-# ============================================================
-class LLMService:
-    def __init__(self):
-        self.client = client
-        self.fallback_chain = list(TEXT_MODELS.values())
-    
-    def generate(self, messages, model, temperature=0.7, max_tokens=1024):
-        for m in [model] + [x for x in self.fallback_chain if x != model]:
-            try:
-                resp = self.client.chat.completions.create(
-                    model=m,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=REQUEST_TIMEOUT
-                )
-                return resp.choices[0].message.content, m
-            except Exception as e:
-                logger.warning(f"Falha {m}: {e}")
-                time.sleep(0.5)
-        raise Exception("Nenhum modelo disponível")
-    
-    def generate_stream(self, messages, model, temperature=0.7, max_tokens=1024):
-        stream = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-            timeout=REQUEST_TIMEOUT
-        )
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-    
-    def vision(self, image_base64, prompt, temperature=0.7, max_tokens=1024):
-        messages = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-            {"type": "text", "text": prompt}
-        ]}]
-        resp = self.client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=REQUEST_TIMEOUT
-        )
-        return resp.choices[0].message.content, VISION_MODEL
-
-llm = LLMService()
-
-# ============================================================
-# BUSCA WEB (DDGS NOVA)
-# ============================================================
+# ------------------------------------------------------------
+# BUSCA WEB
+# ------------------------------------------------------------
 def web_search(query, num=3):
     try:
         with DDGS() as ddgs:
             results = []
             for r in ddgs.text(query, max_results=num):
                 results.append(f"- {r['title']}: {r['body']}")
-            return "\n".join(results)
-    except:
+            return "\n".join(results) if results else ""
+    except Exception as e:
+        logger.error(f"Busca web falhou: {e}")
         return ""
 
-# ============================================================
-# TTS E EXPORTAÇÃO
-# ============================================================
+# ------------------------------------------------------------
+# LLM SERVICE (com fallback inclusive no streaming)
+# ------------------------------------------------------------
+class LLMService:
+    def __init__(self):
+        self.client = client
+
+    def generate(self, messages, model, temperature=0.7, max_tokens=1024):
+        # Tenta modelo principal, depois fallback para 8B
+        for m in [model, "meta/llama-3.1-8b-instruct"]:
+            try:
+                resp = self.client.chat.completions.create(
+                    model=m,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=30
+                )
+                return resp.choices[0].message.content, m
+            except Exception as e:
+                logger.warning(f"Modelo {m} falhou: {e}")
+        return "❌ Nenhum modelo disponível.", "error"
+
+    def generate_stream(self, messages, model, temperature=0.7, max_tokens=1024):
+        try:
+            stream = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                timeout=30
+            )
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as e:
+            # Fallback sem streaming
+            logger.warning(f"Streaming falhou, tentando fallback sem stream: {e}")
+            try:
+                answer, _ = self.generate(messages, model, temperature, max_tokens)
+                yield answer
+            except:
+                yield f"❌ Erro: {e}"
+
+    def vision(self, image_base64, prompt, temperature=0.7, max_tokens=1024):
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            {"type": "text", "text": prompt}
+        ]}]
+        try:
+            resp = self.client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=30
+            )
+            return resp.choices[0].message.content, VISION_MODEL
+        except Exception as e:
+            logger.error(f"Visão falhou: {e}")
+            raise
+
+llm = LLMService()
+
+# ------------------------------------------------------------
+# TTS (sem warnings de arquivo temporário)
+# ------------------------------------------------------------
 def tts(text):
     try:
-        tts_obj = gTTS(text[:500], lang='pt')
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tts_obj.save(tmp.name)
-        return tmp.name
-    except:
+        os.makedirs("data/tts", exist_ok=True)
+        # Nome único baseado no hash do texto (até 500 chars)
+        text_hash = hashlib.md5(text[:500].encode()).hexdigest()
+        path = f"data/tts/{text_hash}.mp3"
+        if not os.path.exists(path):
+            tts_obj = gTTS(text[:500], lang='pt')
+            tts_obj.save(path)
+        return path
+    except Exception as e:
+        logger.error(f"TTS falhou: {e}")
         return None
 
+# ------------------------------------------------------------
+# EXPORTAÇÃO DE CONVERSAS
+# ------------------------------------------------------------
 def export(messages, fmt='txt'):
     if fmt == 'txt':
         return "\n\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages]).encode()
@@ -247,12 +300,13 @@ def export(messages, fmt='txt'):
         return "\n\n".join([f"## {m['role'].upper()}\n{m['content']}" for m in messages]).encode()
     return b""
 
-# ============================================================
-# INTERFACE
-# ============================================================
+# ------------------------------------------------------------
+# INTERFACE STREAMLIT
+# ------------------------------------------------------------
 st.set_page_config(page_title="Assistente NVIDIA", layout="wide")
 st.markdown("<h1 style='color:#76B900'>🤖 Assistente NVIDIA NIM</h1>", unsafe_allow_html=True)
 
+# Inicialização do estado da conversa
 if "conv_id" not in st.session_state:
     cur = conn.cursor()
     convs = cur.execute("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1").fetchall()
@@ -274,18 +328,19 @@ if "conv_id" not in st.session_state:
 if "streaming" not in st.session_state:
     st.session_state.streaming = True
 
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Configurações")
-    model_name = st.selectbox("Modelo", list(TEXT_MODELS.keys()), index=0)
+    model_name = st.selectbox("Modelo de texto", list(TEXT_MODELS.keys()), index=0)
     model_id = TEXT_MODELS[model_name]
     temperature = st.slider("Temperatura", 0.0, 1.0, 0.7)
     max_tokens = st.slider("Max tokens", 256, 2048, 1024)
     st.session_state.streaming = st.checkbox("Streaming", True)
-    web_enabled = st.checkbox("Busca Web", True)
+    web_enabled = st.checkbox("Busca Web (DDGS)", True)
     st.divider()
-    st.header("📄 PDFs")
+    st.header("📄 PDFs (RAG)")
     uploaded = st.file_uploader("Carregar PDFs", type="pdf", accept_multiple_files=True)
-    if uploaded and st.button("Processar"):
+    if uploaded and st.button("Processar PDFs"):
         total = 0
         for f in uploaded:
             path = f"data/{f.name}"
@@ -294,7 +349,7 @@ with st.sidebar:
             reader = PdfReader(path)
             text = "".join([p.extract_text() or "" for p in reader.pages])
             total += rag.add_document(f.name, text)
-        st.success(f"{total} chunks processados")
+        st.success(f"{total} chunks indexados")
     st.divider()
     if st.button("🗑️ Limpar conversa"):
         conn.execute("DELETE FROM messages WHERE conversation_id=?", (st.session_state.conv_id,))
@@ -302,14 +357,14 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# Exibir histórico
+# Exibição do histórico
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if "image" in msg and msg["image"]:
             st.image(msg["image"], width=300)
         st.markdown(msg["content"])
 
-# Input
+# Input com suporte a imagem
 uploaded_image = st.file_uploader("📎 Imagem (opcional)", type=["png","jpg","jpeg"], key="img")
 prompt = st.chat_input("Digite sua mensagem...")
 
@@ -324,7 +379,7 @@ if prompt:
         image_path = f"data/images/{datetime.now().strftime('%Y%m%d%H%M%S')}.{ext}"
         with open(image_path, "wb") as f:
             f.write(img_bytes)
-    
+
     user_msg = {"role": "user", "content": prompt}
     if image_path:
         user_msg["image"] = image_path
@@ -332,68 +387,98 @@ if prompt:
     conn.execute("INSERT INTO messages (conversation_id, role, content, image_path, model) VALUES (?,?,?,?,?)",
                  (st.session_state.conv_id, "user", prompt, image_path, model_id))
     conn.commit()
-    
+
+    # Atualiza título da conversa se for a primeira mensagem
+    if len(st.session_state.messages) == 1:
+        conn.execute("UPDATE conversations SET title=? WHERE id=?", (prompt[:50], st.session_state.conv_id))
+        conn.commit()
+
     with st.chat_message("user"):
         if image_path:
             st.image(image_path, width=300)
         st.markdown(prompt)
-    
-    rag_text = rag.search(prompt)
-    web_text = web_search(prompt) if web_enabled else ""
-    
-    if image_base64:
-        with st.chat_message("assistant"):
+
+    # Contexto
+    rag_text = ""
+    try:
+        rag_text = rag.search(prompt)
+    except Exception as e:
+        logger.warning(f"RAG ignorado: {e}")
+
+    web_text = ""
+    if web_enabled:
+        try:
+            web_text = web_search(prompt)
+        except Exception as e:
+            logger.warning(f"Busca web ignorada: {e}")
+
+    # Resposta do assistente
+    with st.chat_message("assistant"):
+        if image_base64:
             with st.spinner("🧠 Analisando imagem..."):
                 try:
                     answer, used_model = llm.vision(image_base64, prompt, temperature, max_tokens)
                     st.markdown(answer)
                 except Exception as e:
-                    answer = f"❌ Erro: {e}"
+                    answer = f"❌ Erro no modelo de visão: {e}"
                     st.error(answer)
                     used_model = "error"
-    else:
-        system = f"""Você é um assistente útil.
+        else:
+            system = f"""Você é um assistente útil.
 📚 Documentos: {rag_text if rag_text else 'Nenhum'}
 🌐 Web: {web_text if web_text else 'Nenhuma'}
 Responda em português."""
-        recent = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-MAX_HISTORY:]]
-        final_msgs = [{"role": "system", "content": system}] + recent
-        
-        with st.chat_message("assistant"):
+            recent = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-10:]]
+            final_msgs = [{"role": "system", "content": system}] + recent
+
             if st.session_state.streaming:
                 placeholder = st.empty()
                 full = ""
+                used_model = model_id
                 try:
                     for chunk in llm.generate_stream(final_msgs, model_id, temperature, max_tokens):
                         full += chunk
                         placeholder.markdown(full + "▌")
                     placeholder.markdown(full)
                     answer = full
-                    used_model = model_id
                 except Exception as e:
-                    answer = f"❌ Erro: {e}"
+                    answer = f"❌ Erro no streaming: {e}"
                     placeholder.markdown(answer)
                     used_model = "error"
             else:
                 with st.spinner("Pensando..."):
-                    try:
-                        answer, used_model = llm.generate(final_msgs, model_id, temperature, max_tokens)
-                    except Exception as e:
-                        answer = f"❌ Erro: {e}"
-                        used_model = "error"
-                    st.markdown(answer)
-    
-    st.caption(f"🤖 {used_model}")
-    audio = tts(answer)
-    if audio:
-        with open(audio, "rb") as f:
-            st.audio(f.read(), format="audio/mp3")
-    c1, c2 = st.columns(2)
-    c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
-    c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
-    
+                    answer, used_model = llm.generate(final_msgs, model_id, temperature, max_tokens)
+                st.markdown(answer)
+
+        st.caption(f"🤖 {used_model}")
+
+        # Áudio
+        audio_path = tts(answer)
+        if audio_path and os.path.exists(audio_path):
+            with open(audio_path, "rb") as f:
+                st.audio(f.read(), format="audio/mp3")
+
+        # Downloads
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
+        c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
+        c3.download_button("📝 Conversa", export(st.session_state.messages, 'md'), file_name="conversa.md")
+
+    # Salva no banco
     st.session_state.messages.append({"role": "assistant", "content": answer})
     conn.execute("INSERT INTO messages (conversation_id, role, content, model) VALUES (?,?,?,?)",
                  (st.session_state.conv_id, "assistant", answer, used_model))
     conn.commit()
     st.rerun()
+
+# ------------------------------------------------------------
+# LIMPEZA AUTOMÁTICA
+# ------------------------------------------------------------
+def cleanup():
+    try:
+        conn.close()
+        logger.info("Conexão SQLite fechada")
+    except:
+        pass
+
+atexit.register(cleanup)
