@@ -1,0 +1,20 @@
+# API Keys e secrets
+.env
+secrets.toml
+*.key
+credentials.json
+
+# Dados locais
+data/
+exports/
+uploads/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
