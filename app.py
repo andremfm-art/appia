@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 import atexit
 import hashlib
 
@@ -79,6 +79,8 @@ TEXT_MODELS = {
     "Nemotron 70B": "nvidia/nemotron-70b-instruct",
 }
 VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
+# Modelo de embedding que NÃO exige input_type
+EMBED_MODEL = "baai/bge-m3"
 
 # ------------------------------------------------------------
 # BANCO DE DADOS (com cache)
@@ -137,56 +139,69 @@ def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return np.dot(vec1, vec2) / (norm1 * norm2)
 
 # ------------------------------------------------------------
-# RAG SERVICE (agora sem ChromaDB)
+# RAG SERVICE (CORRIGIDO)
 # ------------------------------------------------------------
 class RAGService:
     def __init__(self):
         self.client = client
         self.store = vector_store
 
-    def embed(self, text, input_type="query"):
+    def embed(self, text):
+        """Gera embedding usando modelo BGE-M3 (não exige input_type)."""
         try:
             resp = self.client.embeddings.create(
                 input=[text],
-                model="nvidia/nv-embedqa-e5-v5",
-                encoding_format="float",
-                extra_body={"input_type": input_type}
+                model=EMBED_MODEL,
+                encoding_format="float"
             )
-            return np.array(resp.data[0].embedding)
+            emb = np.array(resp.data[0].embedding)
+            logger.info(f"Embedding gerado com sucesso, dimensão: {emb.shape}")
+            return emb
         except Exception as e:
-            logger.error(f"Embedding falhou: {e}")
+            logger.error(f"Falha crítica no embedding: {e}")
+            st.error(f"⚠️ Embedding falhou: {e}")
             return None
 
     def search(self, query, k=3):
         if not self.store["embeddings"]:
+            logger.warning("Nenhum documento indexado para busca RAG.")
             return ""
-        emb = self.embed(query, input_type="query")
+        emb = self.embed(query)
         if emb is None:
             return ""
-        # Calcula similaridade com todos os documentos
+        # Calcula similaridade
         scores = []
         for i, doc_emb in enumerate(self.store["embeddings"]):
             sim = cosine_similarity(emb, np.array(doc_emb))
             scores.append((sim, i))
         scores.sort(key=lambda x: x[0], reverse=True)
         top_docs = [self.store["documents"][i] for _, i in scores[:k]]
-        return "\n\n".join(top_docs)
+        logger.info(f"RAG retornou {len(top_docs)} documentos.")
+        return "\n\n---\n\n".join(top_docs)  # Separador claro
 
     def add_document(self, filename, text):
         text = clean_text(text)
+        if not text:
+            st.warning(f"PDF '{filename}' não contém texto extraível.")
+            return 0
         chunks = chunk_text(text)
         count = 0
         for i, chunk in enumerate(chunks):
-            emb = self.embed(chunk, input_type="passage")
+            emb = self.embed(chunk)
             if emb is not None:
                 self.store["documents"].append(chunk)
                 self.store["embeddings"].append(emb.tolist())
                 self.store["ids"].append(f"{filename}_{i}")
                 count += 1
         save_vectors(self.store)
+        logger.info(f"Documento '{filename}' indexado com {count} chunks.")
         return count
 
 rag = RAGService()
@@ -349,8 +364,15 @@ with st.sidebar:
                 fp.write(f.getbuffer())
             reader = PdfReader(path)
             text = "".join([p.extract_text() or "" for p in reader.pages])
-            total += rag.add_document(f.name, text)
-        st.success(f"{total} chunks indexados")
+            if not text.strip():
+                st.warning(f"'{f.name}' não possui texto extraível.")
+                continue
+            added = rag.add_document(f.name, text)
+            total += added
+        if total > 0:
+            st.success(f"✅ {total} chunks indexados com sucesso!")
+        else:
+            st.error("Nenhum texto foi indexado.")
     st.divider()
     if st.button("🗑️ Limpar conversa"):
         conn.execute("DELETE FROM messages WHERE conversation_id=?", (st.session_state.conv_id,))
@@ -358,12 +380,14 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+# Exibir histórico
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if "image" in msg and msg["image"]:
             st.image(msg["image"], width=300)
         st.markdown(msg["content"])
 
+# Input
 uploaded_image = st.file_uploader("📎 Imagem (opcional)", type=["png","jpg","jpeg"], key="img")
 prompt = st.chat_input("Digite sua mensagem...")
 
@@ -396,7 +420,18 @@ if prompt:
             st.image(image_path, width=300)
         st.markdown(prompt)
 
-    rag_text = rag.search(prompt) if prompt else ""
+    # RAG com indicador visual
+    rag_text = ""
+    if vector_store["embeddings"]:
+        with st.spinner("🔍 Buscando nos documentos..."):
+            rag_text = rag.search(prompt)
+        if rag_text:
+            st.info("📚 Contexto RAG carregado.")
+        else:
+            st.warning("Nenhum trecho relevante encontrado nos PDFs.")
+    else:
+        st.info("ℹ️ Nenhum PDF foi processado ainda. Use a barra lateral para carregar documentos.")
+
     web_text = web_search(prompt) if web_enabled else ""
 
     with st.chat_message("assistant"):
@@ -410,10 +445,17 @@ if prompt:
                     st.error(answer)
                     used_model = "error"
         else:
-            system = f"""Você é um assistente útil.
-📚 Documentos: {rag_text if rag_text else 'Nenhum'}
-🌐 Web: {web_text if web_text else 'Nenhuma'}
-Responda em português."""
+            # System prompt FORTE para obrigar o uso do RAG
+            system = f"""Você é um assistente de IA. Utilize EXCLUSIVAMENTE as informações fornecidas nos documentos PDF abaixo para responder à pergunta. Se os documentos não contiverem a resposta, diga 'Não encontrei essa informação nos documentos fornecidos'. 
+
+📚 DOCUMENTOS PDF (use este conteúdo para responder):
+{rag_text if rag_text else "Nenhum documento foi carregado."}
+
+🌐 INFORMAÇÕES DA WEB (use apenas se os documentos não responderem):
+{web_text if web_text else "Nenhuma."}
+
+Responda em português, de forma clara e objetiva, citando trechos dos documentos quando possível."""
+
             recent = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[-10:]]
             final_msgs = [{"role": "system", "content": system}] + recent
 
