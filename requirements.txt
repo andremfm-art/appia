@@ -1,10 +1,10 @@
 streamlit
 openai
 pypdf
-chromadb
 ddgs
 gtts
 python-docx
 requests
 Pillow
 protobuf
+numpy
