@@ -1,7 +1,6 @@
 import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
-import chromadb
 from ddgs import DDGS
 from gtts import gTTS
 from docx import Document
@@ -10,10 +9,12 @@ import os
 import base64
 import time
 import logging
+import pickle
+import numpy as np
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import atexit
 import hashlib
 
@@ -109,18 +110,21 @@ def get_db_connection():
 conn = get_db_connection()
 
 # ------------------------------------------------------------
-# CHROMADB (RAG) – inicialização segura
+# ARMAZENAMENTO VETORIAL LOCAL (substituto do ChromaDB)
 # ------------------------------------------------------------
-@st.cache_resource
-def get_chroma_collection():
-    try:
-        client = chromadb.PersistentClient(path="data/chroma_db")
-        return client.get_or_create_collection(name="docs")
-    except Exception as e:
-        logger.warning(f"ChromaDB não inicializado: {e}")
-        return None
+VECTORS_FILE = "data/vectors.pkl"
 
-collection = get_chroma_collection()
+def load_vectors():
+    if os.path.exists(VECTORS_FILE):
+        with open(VECTORS_FILE, "rb") as f:
+            return pickle.load(f)
+    return {"documents": [], "embeddings": [], "ids": []}
+
+def save_vectors(data):
+    with open(VECTORS_FILE, "wb") as f:
+        pickle.dump(data, f)
+
+vector_store = load_vectors()
 
 # ------------------------------------------------------------
 # FUNÇÕES AUXILIARES
@@ -132,13 +136,16 @@ def clean_text(text):
 def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
 # ------------------------------------------------------------
-# RAG SERVICE
+# RAG SERVICE (agora sem ChromaDB)
 # ------------------------------------------------------------
 class RAGService:
     def __init__(self):
         self.client = client
-        self.collection = collection
+        self.store = vector_store
 
     def embed(self, text, input_type="query"):
         try:
@@ -148,39 +155,38 @@ class RAGService:
                 encoding_format="float",
                 extra_body={"input_type": input_type}
             )
-            return resp.data[0].embedding
+            return np.array(resp.data[0].embedding)
         except Exception as e:
             logger.error(f"Embedding falhou: {e}")
             return None
 
     def search(self, query, k=3):
-        if not self.collection:
+        if not self.store["embeddings"]:
             return ""
         emb = self.embed(query, input_type="query")
-        if not emb:
+        if emb is None:
             return ""
-        try:
-            results = self.collection.query(query_embeddings=[emb], n_results=k)
-            if results.get('documents'):
-                return "\n\n".join(results['documents'][0])
-        except Exception as e:
-            logger.error(f"Erro na busca RAG: {e}")
-        return ""
+        # Calcula similaridade com todos os documentos
+        scores = []
+        for i, doc_emb in enumerate(self.store["embeddings"]):
+            sim = cosine_similarity(emb, np.array(doc_emb))
+            scores.append((sim, i))
+        scores.sort(key=lambda x: x[0], reverse=True)
+        top_docs = [self.store["documents"][i] for _, i in scores[:k]]
+        return "\n\n".join(top_docs)
 
     def add_document(self, filename, text):
-        if not self.collection:
-            return 0
         text = clean_text(text)
         chunks = chunk_text(text)
         count = 0
         for i, chunk in enumerate(chunks):
             emb = self.embed(chunk, input_type="passage")
-            if emb:
-                try:
-                    self.collection.add(documents=[chunk], embeddings=[emb], ids=[f"{filename}_{i}"])
-                    count += 1
-                except Exception as e:
-                    logger.error(f"Erro ao adicionar chunk: {e}")
+            if emb is not None:
+                self.store["documents"].append(chunk)
+                self.store["embeddings"].append(emb.tolist())
+                self.store["ids"].append(f"{filename}_{i}")
+                count += 1
+        save_vectors(self.store)
         return count
 
 rag = RAGService()
@@ -200,14 +206,13 @@ def web_search(query, num=3):
         return ""
 
 # ------------------------------------------------------------
-# LLM SERVICE (com fallback inclusive no streaming)
+# LLM SERVICE
 # ------------------------------------------------------------
 class LLMService:
     def __init__(self):
         self.client = client
 
     def generate(self, messages, model, temperature=0.7, max_tokens=1024):
-        # Tenta modelo principal, depois fallback para 8B
         for m in [model, "meta/llama-3.1-8b-instruct"]:
             try:
                 resp = self.client.chat.completions.create(
@@ -236,8 +241,7 @@ class LLMService:
                 if chunk.choices[0].delta.content:
                     yield chunk.choices[0].delta.content
         except Exception as e:
-            # Fallback sem streaming
-            logger.warning(f"Streaming falhou, tentando fallback sem stream: {e}")
+            logger.warning(f"Streaming falhou, fallback sem stream: {e}")
             try:
                 answer, _ = self.generate(messages, model, temperature, max_tokens)
                 yield answer
@@ -265,12 +269,11 @@ class LLMService:
 llm = LLMService()
 
 # ------------------------------------------------------------
-# TTS (sem warnings de arquivo temporário)
+# TTS (sem warnings)
 # ------------------------------------------------------------
 def tts(text):
     try:
         os.makedirs("data/tts", exist_ok=True)
-        # Nome único baseado no hash do texto (até 500 chars)
         text_hash = hashlib.md5(text[:500].encode()).hexdigest()
         path = f"data/tts/{text_hash}.mp3"
         if not os.path.exists(path):
@@ -282,7 +285,7 @@ def tts(text):
         return None
 
 # ------------------------------------------------------------
-# EXPORTAÇÃO DE CONVERSAS
+# EXPORTAÇÃO
 # ------------------------------------------------------------
 def export(messages, fmt='txt'):
     if fmt == 'txt':
@@ -306,7 +309,6 @@ def export(messages, fmt='txt'):
 st.set_page_config(page_title="Assistente NVIDIA", layout="wide")
 st.markdown("<h1 style='color:#76B900'>🤖 Assistente NVIDIA NIM</h1>", unsafe_allow_html=True)
 
-# Inicialização do estado da conversa
 if "conv_id" not in st.session_state:
     cur = conn.cursor()
     convs = cur.execute("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1").fetchall()
@@ -328,7 +330,6 @@ if "conv_id" not in st.session_state:
 if "streaming" not in st.session_state:
     st.session_state.streaming = True
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Configurações")
     model_name = st.selectbox("Modelo de texto", list(TEXT_MODELS.keys()), index=0)
@@ -357,14 +358,12 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# Exibição do histórico
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if "image" in msg and msg["image"]:
             st.image(msg["image"], width=300)
         st.markdown(msg["content"])
 
-# Input com suporte a imagem
 uploaded_image = st.file_uploader("📎 Imagem (opcional)", type=["png","jpg","jpeg"], key="img")
 prompt = st.chat_input("Digite sua mensagem...")
 
@@ -388,7 +387,6 @@ if prompt:
                  (st.session_state.conv_id, "user", prompt, image_path, model_id))
     conn.commit()
 
-    # Atualiza título da conversa se for a primeira mensagem
     if len(st.session_state.messages) == 1:
         conn.execute("UPDATE conversations SET title=? WHERE id=?", (prompt[:50], st.session_state.conv_id))
         conn.commit()
@@ -398,21 +396,9 @@ if prompt:
             st.image(image_path, width=300)
         st.markdown(prompt)
 
-    # Contexto
-    rag_text = ""
-    try:
-        rag_text = rag.search(prompt)
-    except Exception as e:
-        logger.warning(f"RAG ignorado: {e}")
+    rag_text = rag.search(prompt) if prompt else ""
+    web_text = web_search(prompt) if web_enabled else ""
 
-    web_text = ""
-    if web_enabled:
-        try:
-            web_text = web_search(prompt)
-        except Exception as e:
-            logger.warning(f"Busca web ignorada: {e}")
-
-    # Resposta do assistente
     with st.chat_message("assistant"):
         if image_base64:
             with st.spinner("🧠 Analisando imagem..."):
@@ -442,7 +428,7 @@ Responda em português."""
                     placeholder.markdown(full)
                     answer = full
                 except Exception as e:
-                    answer = f"❌ Erro no streaming: {e}"
+                    answer = f"❌ Erro: {e}"
                     placeholder.markdown(answer)
                     used_model = "error"
             else:
@@ -452,19 +438,16 @@ Responda em português."""
 
         st.caption(f"🤖 {used_model}")
 
-        # Áudio
         audio_path = tts(answer)
         if audio_path and os.path.exists(audio_path):
             with open(audio_path, "rb") as f:
                 st.audio(f.read(), format="audio/mp3")
 
-        # Downloads
         c1, c2, c3 = st.columns(3)
         c1.download_button("📄 TXT", export([{"role":"assistant","content":answer}], 'txt'), file_name="resposta.txt")
         c2.download_button("📑 DOCX", export([{"role":"assistant","content":answer}], 'docx'), file_name="resposta.docx")
         c3.download_button("📝 Conversa", export(st.session_state.messages, 'md'), file_name="conversa.md")
 
-    # Salva no banco
     st.session_state.messages.append({"role": "assistant", "content": answer})
     conn.execute("INSERT INTO messages (conversation_id, role, content, model) VALUES (?,?,?,?)",
                  (st.session_state.conv_id, "assistant", answer, used_model))
@@ -472,12 +455,11 @@ Responda em português."""
     st.rerun()
 
 # ------------------------------------------------------------
-# LIMPEZA AUTOMÁTICA
+# LIMPEZA
 # ------------------------------------------------------------
 def cleanup():
     try:
         conn.close()
-        logger.info("Conexão SQLite fechada")
     except:
         pass
 
