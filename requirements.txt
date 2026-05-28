@@ -8,3 +8,4 @@ python-docx==1.1.0
 requests==2.31.0
 Pillow==10.2.0
 python-dotenv==1.0.1
+NVIDIA_API_KEY=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
