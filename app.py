@@ -111,27 +111,34 @@ def get_db_connection():
 conn = get_db_connection()
 
 # ------------------------------------------------------------
-# MODELO DE EMBEDDING LOCAL (substituto da API)
+# MODELO DE EMBEDDING LOCAL
 # ------------------------------------------------------------
 @st.cache_resource
 def load_local_embedder():
-    """Carrega modelo de embedding leve e offline."""
     logger.info("Carregando modelo de embedding local...")
     model = SentenceTransformer('all-MiniLM-L6-v2')
     logger.info("Modelo de embedding carregado com sucesso.")
     return model
 
 embedder = load_local_embedder()
+# Dimensão esperada para o modelo all-MiniLM-L6-v2: 384
+EMBEDDING_DIM = embedder.get_sentence_embedding_dimension()
 
 # ------------------------------------------------------------
-# ARMAZENAMENTO VETORIAL LOCAL
+# ARMAZENAMENTO VETORIAL LOCAL (com verificação de dimensão)
 # ------------------------------------------------------------
 VECTORS_FILE = "data/vectors.pkl"
 
 def load_vectors():
     if os.path.exists(VECTORS_FILE):
         with open(VECTORS_FILE, "rb") as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+        # Verificar consistência: se há embeddings salvos, a dimensão deve bater com o modelo atual
+        if data.get("embeddings") and len(data["embeddings"]) > 0:
+            if len(data["embeddings"][0]) != EMBEDDING_DIM:
+                logger.warning(f"Dimensão dos embeddings salvos ({len(data['embeddings'][0])}) não confere com a dimensão do modelo ({EMBEDDING_DIM}). Descartando dados antigos.")
+                return {"documents": [], "embeddings": [], "ids": []}
+        return data
     return {"documents": [], "embeddings": [], "ids": []}
 
 def save_vectors(data):
@@ -151,14 +158,17 @@ def chunk_text(text, size=1000, overlap=200):
     return [text[i:i+size] for i in range(0, len(text), size-overlap)]
 
 def cosine_similarity(vec1, vec2):
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0 or norm2 == 0:
+    # Garante arrays numpy
+    a = np.asarray(vec1)
+    b = np.asarray(vec2)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
         return 0.0
-    return np.dot(vec1, vec2) / (norm1 * norm2)
+    return np.dot(a, b) / (norm_a * norm_b)
 
 # ------------------------------------------------------------
-# RAG SERVICE (agora com embedding LOCAL)
+# RAG SERVICE (com modelo local)
 # ------------------------------------------------------------
 class RAGService:
     def __init__(self):
@@ -166,17 +176,14 @@ class RAGService:
         self.model = embedder
 
     def embed(self, text):
-        """Gera embedding usando modelo SentenceTransformer local."""
         try:
-            emb = self.model.encode(text)
-            return emb
+            return self.model.encode(text)
         except Exception as e:
             logger.error(f"Falha no embedding local: {e}")
             return None
 
     def search(self, query, k=3):
         if not self.store["embeddings"]:
-            logger.warning("Nenhum documento indexado.")
             return ""
         emb = self.embed(query)
         if emb is None:
@@ -187,25 +194,26 @@ class RAGService:
             scores.append((sim, i))
         scores.sort(key=lambda x: x[0], reverse=True)
         top_docs = [self.store["documents"][i] for _, i in scores[:k]]
-        logger.info(f"RAG retornou {len(top_docs)} documentos.")
         return "\n\n---\n\n".join(top_docs)
 
     def add_document(self, filename, text):
         text = clean_text(text)
         if not text:
-            st.warning(f"'{filename}' não contém texto.")
             return 0
         chunks = chunk_text(text)
         count = 0
         for i, chunk in enumerate(chunks):
             emb = self.embed(chunk)
             if emb is not None:
+                # Garantir consistência de dimensão
+                if len(self.store["embeddings"]) > 0 and len(emb) != len(self.store["embeddings"][0]):
+                    logger.warning("Dimensão do embedding diferente dos existentes. Recriando índice.")
+                    self.store = {"documents": [], "embeddings": [], "ids": []}
                 self.store["documents"].append(chunk)
                 self.store["embeddings"].append(emb.tolist())
                 self.store["ids"].append(f"{filename}_{i}")
                 count += 1
         save_vectors(self.store)
-        logger.info(f"'{filename}' indexado com {count} chunks.")
         return count
 
 rag = RAGService()
@@ -288,7 +296,7 @@ class LLMService:
 llm = LLMService()
 
 # ------------------------------------------------------------
-# TTS (sem warnings)
+# TTS
 # ------------------------------------------------------------
 def tts(text):
     try:
@@ -424,17 +432,21 @@ if prompt:
             st.image(image_path, width=300)
         st.markdown(prompt)
 
-    # RAG local (sem API)
+    # RAG com captura de erros
     rag_text = ""
-    if vector_store["embeddings"]:
-        with st.spinner("🔍 Buscando nos documentos..."):
-            rag_text = rag.search(prompt)
-        if rag_text:
-            st.info("📚 Contexto RAG carregado.")
+    try:
+        if vector_store["embeddings"]:
+            with st.spinner("🔍 Buscando nos documentos..."):
+                rag_text = rag.search(prompt)
+            if rag_text:
+                st.info("📚 Contexto RAG carregado.")
+            else:
+                st.warning("Nenhum trecho relevante encontrado nos PDFs.")
         else:
-            st.warning("Nenhum trecho relevante encontrado nos PDFs.")
-    else:
-        st.info("ℹ️ Nenhum PDF foi processado ainda. Use a barra lateral para carregar documentos.")
+            st.info("ℹ️ Nenhum PDF foi processado ainda.")
+    except Exception as e:
+        logger.error(f"Erro no RAG: {e}")
+        st.error("Falha ao buscar nos documentos, mas o chat continua funcionando.")
 
     web_text = web_search(prompt) if web_enabled else ""
 
