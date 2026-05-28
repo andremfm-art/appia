@@ -1,47 +1,14 @@
-# =========================================================
-# NVIDIA NIM Assistant - Dependências
-# =========================================================
-# Instalação: pip install -r requirements.txt
-# =========================================================
-
-# Core Web Framework
-streamlit>=1.32.0
-
-# NVIDIA API Client (OpenAI compatible)
-openai>=1.23.0
-
-# PDF Processing
-pypdf>=4.0.0
-
-# Vector Database (RAG)
-chromadb>=0.4.22
-
-# Web Search
-duckduckgo-search>=5.2.0
-
-# Text-to-Speech
-gtts>=2.5.1
-
-# Document Export
-python-docx>=1.1.0
-
-# HTTP Requests
-requests>=2.31.0
-
-# Image Processing
-Pillow>=10.2.0
-
-# Environment Variables (Security)
-python-dotenv>=1.0.1
-
-# =========================================================
-# Dependências opcionais (já incluídas no Python)
-# =========================================================
-# sqlite3 (built-in)
-# tempfile (built-in)
-# pathlib (built-in)
-# logging (built-in)
-# base64 (built-in)
-# datetime (built-in)
-# typing (built-in)
-# atexit (built-in)
+streamlit==1.32.0
+openai==1.35.0
+pypdf==4.2.0
+chromadb==0.4.24
+duckduckgo-search==5.3.0
+gtts==2.5.3
+python-docx==1.1.2
+requests==2.32.0
+Pillow==10.3.0
+protobuf==4.25.3
+opentelemetry-api==1.24.0
+opentelemetry-sdk==1.24.0
+opentelemetry-exporter-otlp==1.24.0
+grpcio==1.62.1
